@@ -132,7 +132,7 @@ class AfreecaTV(Plugin):
 
     def _get_stream_info(self, broadcast, quality, rmd):
         params = {
-            "return_type": "gs_cdn_pc_web",
+            "return_type": "gcp_cdn",
             "broad_key": f"{broadcast}-common-{quality}-hls",
         }
         res = self.session.http.get(f"{rmd}/broad_stream_assign.html", params=params)
