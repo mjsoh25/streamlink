@@ -79,19 +79,19 @@ class PluginCanHandleUrl:
 
     @classmethod
     def urls_unnamed(cls) -> List[TUrl]:
-        return [item for item in cls.urls_all() if type(item) is str]  # noqa: E721
+        return [item for item in cls.urls_all() if type(item) is str]
 
     @classmethod
     def urls_named(cls) -> List[TUrlNamed]:
-        return [item for item in cls.urls_all() if type(item) is tuple]  # noqa: E721
+        return [item for item in cls.urls_all() if type(item) is tuple]
 
     @classmethod
     def urlgroups_unnamed(cls) -> List[Tuple[TUrl, TMatchGroup]]:
-        return [(item, groups) for item, groups in cls.should_match_groups if type(item) is str]  # noqa: E721
+        return [(item, groups) for item, groups in cls.should_match_groups if type(item) is str]
 
     @classmethod
     def urlgroups_named(cls) -> List[Tuple[TName, TUrl, TMatchGroup]]:
-        return [(item[0], item[1], groups) for item, groups in cls.should_match_groups if type(item) is tuple]  # noqa: E721
+        return [(item[0], item[1], groups) for item, groups in cls.should_match_groups if type(item) is tuple]
 
     @classmethod
     def urls_negative(cls) -> List[TUrl]:
@@ -119,7 +119,7 @@ class PluginCanHandleUrl:
     def test_class_setup(self):
         assert hasattr(self, "__plugin__"), "Test has a __plugin__ attribute"
         assert issubclass(self.__plugin__, Plugin), "Test has a __plugin__ that is a subclass of the Plugin class"
-        assert len(self.should_match) + len(self.should_match_groups) > 0, "Test has at least one positive URL"
+        assert self.should_match or self.should_match_groups, "Test has at least one positive URL"
 
     def test_class_name(self, classnames: Set[str]):
         assert self.__class__.__name__ not in classnames
@@ -129,7 +129,7 @@ class PluginCanHandleUrl:
     def test_all_matchers_match(self, matcher: Matcher):
         assert any(  # pragma: no branch
             matcher.pattern.match(url)
-            for url in [(item if type(item) is str else item[1]) for item in self.urls_all()]  # noqa: E721
+            for url in [(item if type(item) is str else item[1]) for item in self.urls_all()]
         ), "Matcher matches at least one URL"
 
     def test_all_named_matchers_have_tests(self, matcher: Matcher):

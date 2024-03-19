@@ -12,21 +12,27 @@ import logging
 import re
 from html import unescape as html_unescape
 from typing import Dict
+from urllib.parse import parse_qsl
 
 from streamlink.plugin import Plugin, pluginmatcher
 from streamlink.plugin.api import validate
 from streamlink.stream.http import HTTPStream
-from streamlink.utils.url import update_scheme
+from streamlink.utils.url import update_qsd, update_scheme
 
 
 log = logging.getLogger(__name__)
 
 
 @pluginmatcher(re.compile(
-    r"https?://(?:www\.)?huya\.com/(?P<channel>[^/]+)",
+    r"https?://(?:www\.)?huya\.com/(?P<channel>[^/?]+)",
 ))
 class Huya(Plugin):
     QUALITY_WEIGHTS: Dict[str, int] = {}
+
+    _QUALITY_WEIGHTS_OVERRIDE = {
+        "source_hy": -1000,  # SSLCertVerificationError
+    }
+    _STREAM_URL_QUERYSTRING_PARAMS = "wsSecret", "wsTime"
 
     @classmethod
     def stream_weight(cls, key):
@@ -70,7 +76,7 @@ class Huya(Plugin):
                                 "sStreamName": str,
                                 "sFlvUrl": str,
                                 "sFlvUrlSuffix": str,
-                                "sFlvAntiCode": validate.all(str, validate.transform(lambda v: html_unescape(v))),
+                                "sFlvAntiCode": validate.all(str, validate.transform(html_unescape)),
                             },
                             validate.union_get(
                                 "sCdnType",
@@ -97,10 +103,19 @@ class Huya(Plugin):
 
         self.id, self.author, self.title, streamdata = data
 
+        self.session.http.headers.update({
+            "Origin": "https://www.huya.com",
+            "Referer": "https://www.huya.com/",
+        })
+
         for cdntype, priority, streamname, flvurl, suffix, anticode in streamdata:
+            qs = {k: v for k, v in dict(parse_qsl(anticode)).items() if k in self._STREAM_URL_QUERYSTRING_PARAMS}
+            url = update_scheme("https://", f"{flvurl}/{streamname}.{suffix}")
+            url = update_qsd(url, qs)
+
             name = f"source_{cdntype.lower()}"
-            self.QUALITY_WEIGHTS[name] = priority
-            yield name, HTTPStream(self.session, update_scheme("https://", f"{flvurl}/{streamname}.{suffix}?{anticode}"))
+            self.QUALITY_WEIGHTS[name] = self._QUALITY_WEIGHTS_OVERRIDE.get(name, priority)
+            yield name, HTTPStream(self.session, url)
 
         log.debug(f"QUALITY_WEIGHTS: {self.QUALITY_WEIGHTS!r}")
 

@@ -1,7 +1,6 @@
 """
 $description United Arab Emirates CDN hosting live content for various websites in The Middle East.
 $url alwasat.ly
-$url media.gov.kw
 $type live
 $region various
 """
@@ -19,7 +18,6 @@ log = logging.getLogger(__name__)
 
 
 @pluginmatcher(name="alwasatly", pattern=re.compile(r"https?://(?:www\.)?alwasat\.ly"))
-@pluginmatcher(name="mediagovkw", pattern=re.compile(r"https?://(?:www\.)?media\.gov\.kw"))
 class HiPlayer(Plugin):
     DAI_URL = "https://pubads.g.doubleclick.net/ssai/event/{0}/streams"
 
@@ -51,7 +49,7 @@ class HiPlayer(Plugin):
                 validate.none_or_all(
                     validate.get("data"),
                     validate.transform(lambda s: re.sub(r"['\", ]", "", s)),
-                    validate.transform(lambda s: base64.b64decode(s)),
+                    validate.transform(base64.b64decode),
                     validate.parse_json(),
                     validate.any(
                         None,

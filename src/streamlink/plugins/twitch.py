@@ -17,30 +17,33 @@ import base64
 import logging
 import re
 import sys
+from contextlib import suppress
+from dataclasses import dataclass, replace as dataclass_replace
 from datetime import datetime, timedelta
 from json import dumps as json_dumps
 from random import random
-from typing import List, Mapping, NamedTuple, Optional, Tuple
+from typing import ClassVar, Mapping, Optional, Tuple, Type
 from urllib.parse import urlparse
+
+from requests.exceptions import HTTPError
 
 from streamlink.exceptions import NoStreamsError, PluginError
 from streamlink.plugin import Plugin, pluginargument, pluginmatcher
 from streamlink.plugin.api import validate
 from streamlink.session import Streamlink
-from streamlink.stream.hls import HLSStream, HLSStreamReader, HLSStreamWorker, HLSStreamWriter
-from streamlink.stream.hls_playlist import (
+from streamlink.stream.hls import (
     M3U8,
-    ByteRange,
     DateRange,
-    ExtInf,
-    Key,
+    HLSPlaylist,
+    HLSSegment,
+    HLSStream,
+    HLSStreamReader,
+    HLSStreamWorker,
+    HLSStreamWriter,
     M3U8Parser,
-    Map,
-    load as load_hls_playlist,
     parse_tag,
 )
 from streamlink.stream.http import HTTPStream
-from streamlink.utils.args import keyvalue
 from streamlink.utils.parse import parse_json, parse_qsd
 from streamlink.utils.random import CHOICES_ALPHA_NUM, random_token
 from streamlink.utils.times import fromtimestamp, hours_minutes_seconds_float
@@ -52,35 +55,21 @@ log = logging.getLogger(__name__)
 LOW_LATENCY_MAX_LIVE_EDGE = 2
 
 
-class TwitchSegment(NamedTuple):
-    uri: str
-    duration: float
-    title: Optional[str]
-    key: Optional[Key]
-    discontinuity: bool
-    byterange: Optional[ByteRange]
-    date: Optional[datetime]
-    map: Optional[Map]
+@dataclass
+class TwitchHLSSegment(HLSSegment):
     ad: bool
     prefetch: bool
 
 
-# generic namedtuples are unsupported, so just subclass
-class TwitchSequence(NamedTuple):
-    num: int
-    segment: TwitchSegment
-
-
-class TwitchM3U8(M3U8):
-    segments: List[TwitchSegment]  # type: ignore[assignment]
-
+class TwitchM3U8(M3U8[TwitchHLSSegment, HLSPlaylist]):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.dateranges_ads = []
 
 
-class TwitchM3U8Parser(M3U8Parser):
-    m3u8: TwitchM3U8
+class TwitchM3U8Parser(M3U8Parser[TwitchM3U8, TwitchHLSSegment, HLSPlaylist]):
+    __m3u8__: ClassVar[Type[TwitchM3U8]] = TwitchM3U8
+    __segment__: ClassVar[Type[TwitchHLSSegment]] = TwitchHLSSegment
 
     @parse_tag("EXT-X-TWITCH-PREFETCH")
     def parse_tag_ext_x_twitch_prefetch(self, value):
@@ -95,15 +84,13 @@ class TwitchM3U8Parser(M3U8Parser):
         # Use the last duration for extrapolating the start time of the prefetch segment, which is needed for checking
         # whether it is an ad segment and matches the parsed date ranges or not
         date = last.date + timedelta(seconds=last.duration)
-        # Don't reset the discontinuity state in prefetch segments (at the bottom of the playlist)
-        discontinuity = self._discontinuity
         # Always treat prefetch segments after a discontinuity as ad segments
-        ad = discontinuity or self._is_segment_ad(date)
-        segment = last._replace(
+        ad = self._discontinuity or self._is_segment_ad(date)
+        segment = dataclass_replace(
+            last,
             uri=self.uri(value),
             duration=duration,
             title=None,
-            discontinuity=discontinuity,
             date=date,
             ad=ad,
             prefetch=True,
@@ -117,34 +104,11 @@ class TwitchM3U8Parser(M3U8Parser):
         if self._is_daterange_ad(daterange):
             self.m3u8.dateranges_ads.append(daterange)
 
-    # TODO: fix this mess by switching to segment dataclasses with inheritance
-    def get_segment(self, uri: str) -> TwitchSegment:  # type: ignore[override]
-        extinf: ExtInf = self._extinf or ExtInf(0, None)
-        self._extinf = None
+    def get_segment(self, uri: str, **data) -> TwitchHLSSegment:
+        ad = self._is_segment_ad(self._date, self._extinf.title if self._extinf else None)
+        segment: TwitchHLSSegment = super().get_segment(uri, ad=ad, prefetch=False)  # type: ignore[assignment]
 
-        discontinuity = self._discontinuity
-        self._discontinuity = False
-
-        byterange = self._byterange
-        self._byterange = None
-
-        date = self._date
-        self._date = None
-
-        ad = self._is_segment_ad(date, extinf.title)
-
-        return TwitchSegment(
-            uri=uri,
-            duration=extinf.duration,
-            title=extinf.title,
-            key=self._key,
-            discontinuity=discontinuity,
-            byterange=byterange,
-            date=date,
-            map=self._map,
-            ad=ad,
-            prefetch=False,
-        )
+        return segment
 
     def _is_segment_ad(self, date: Optional[datetime], title: Optional[str] = None) -> bool:
         return (
@@ -170,30 +134,27 @@ class TwitchHLSStreamWorker(HLSStreamWorker):
         self.had_content = False
         super().__init__(reader, *args, **kwargs)
 
-    def _reload_playlist(self, *args):
-        return load_hls_playlist(*args, parser=TwitchM3U8Parser, m3u8=TwitchM3U8)
+    def _playlist_reload_time(self, playlist: TwitchM3U8):  # type: ignore[override]
+        if self.stream.low_latency and playlist.segments:
+            return playlist.segments[-1].duration
 
-    def _playlist_reload_time(self, playlist: TwitchM3U8, sequences: List[TwitchSequence]):  # type: ignore[override]
-        if self.stream.low_latency and sequences:
-            return sequences[-1].segment.duration
+        return super()._playlist_reload_time(playlist)
 
-        return super()._playlist_reload_time(playlist, sequences)  # type: ignore[arg-type]
-
-    def process_sequences(self, playlist: TwitchM3U8, sequences: List[TwitchSequence]):  # type: ignore[override]
+    def process_segments(self, playlist: TwitchM3U8):  # type: ignore[override]
         # ignore prefetch segments if not LL streaming
         if not self.stream.low_latency:
-            sequences = [seq for seq in sequences if not seq.segment.prefetch]
+            playlist.segments = [segment for segment in playlist.segments if not segment.prefetch]
 
         # check for sequences with real content
         if not self.had_content:
-            self.had_content = next((True for seq in sequences if not seq.segment.ad), False)
+            self.had_content = next((True for segment in playlist.segments if not segment.ad), False)
 
             # When filtering ads, to check whether it's a LL stream, we need to wait for the real content to show up,
             # since playlists with only ad segments don't contain prefetch segments
             if (
                 self.stream.low_latency
                 and self.had_content
-                and not next((True for seq in sequences if seq.segment.prefetch), False)
+                and not next((True for segment in playlist.segments if segment.prefetch), False)
             ):
                 log.info("This is not a low latency stream")
 
@@ -201,15 +162,15 @@ class TwitchHLSStreamWorker(HLSStreamWorker):
         if self.stream.disable_ads and self.playlist_sequence == -1 and not self.had_content:
             log.info("Waiting for pre-roll ads to finish, be patient")
 
-        return super().process_sequences(playlist, sequences)  # type: ignore[arg-type]
+        return super().process_segments(playlist)
 
 
 class TwitchHLSStreamWriter(HLSStreamWriter):
     reader: "TwitchHLSStreamReader"
     stream: "TwitchHLSStream"
 
-    def should_filter_sequence(self, sequence: TwitchSequence):  # type: ignore[override]
-        return self.stream.disable_ads and sequence.segment.ad
+    def should_filter_segment(self, segment: TwitchHLSSegment) -> bool:  # type: ignore[override]
+        return self.stream.disable_ads and segment.ad
 
 
 class TwitchHLSStreamReader(HLSStreamReader):
@@ -233,6 +194,7 @@ class TwitchHLSStreamReader(HLSStreamReader):
 
 class TwitchHLSStream(HLSStream):
     __reader__ = TwitchHLSStreamReader
+    __parser__ = TwitchM3U8Parser
 
     def __init__(self, *args, disable_ads: bool = False, low_latency: bool = False, **kwargs):
         super().__init__(*args, **kwargs)
@@ -524,18 +486,6 @@ class TwitchAPI:
             ),
         ))
 
-    def stream_metadata(self, channel):
-        query = self._gql_persisted_query(
-            "StreamMetadata",
-            "1c719a40e481453e5c48d9bb585d971b8b372f8ebb105b17076722264dfa5b3e",
-            channelLogin=channel,
-        )
-
-        return self.call(query, schema=validate.Schema(
-            {"data": {"user": {"stream": {"type": str}}}},
-            validate.get(("data", "user", "stream")),
-        ))
-
 
 class TwitchClientIntegrity:
     URL_P_SCRIPT = "https://k.twitchcdn.net/149e9513-01fa-4fb0-aad4-566afd725d1b/2d206a39-8ed7-437e-a3be-862e0f06eea3/p.js"
@@ -591,8 +541,8 @@ class TwitchClientIntegrity:
         headers: Mapping[str, str],
         device_id: str,
     ) -> Optional[Tuple[str, int]]:
-        from streamlink.webbrowser.cdp import CDPClient, CDPClientSession, devtools
-        from streamlink.webbrowser.exceptions import WebbrowserError
+        from exceptiongroup import BaseExceptionGroup, catch  # noqa: PLC0415, I001
+        from streamlink.webbrowser.cdp import CDPClient, CDPClientSession, devtools  # noqa: PLC0415
 
         url = f"https://www.twitch.tv/{channel}"
         js_get_integrity_token = cls.JS_INTEGRITY_TOKEN \
@@ -600,6 +550,8 @@ class TwitchClientIntegrity:
             .replace("HEADERS", json_dumps(headers)) \
             .replace("DEVICE_ID", device_id)
         eval_timeout = session.get_option("webbrowser-timeout")
+        # noinspection PyUnusedLocal
+        client_integrity: Optional[str] = None
 
         async def on_main(client_session: CDPClientSession, request: devtools.fetch.RequestPaused):
             async with client_session.alter_request(request) as cm:
@@ -613,11 +565,20 @@ class TwitchClientIntegrity:
                     await client_session.loaded(frame_id)
                     return await client_session.evaluate(js_get_integrity_token, timeout=eval_timeout)
 
-        try:
-            client_integrity: Optional[str] = CDPClient.launch(session, acquire_client_integrity_token)
-        except WebbrowserError as err:
-            log.error(f"{type(err).__name__}: {err}")
-            return None
+        def handle_error(exc_grp: BaseExceptionGroup) -> None:
+            for err in exc_grp.exceptions:
+                log.error(f"{type(err).__name__}: {err}")
+
+        with catch({  # type: ignore[dict-item]  # bug in exceptiongroup==1.2.0
+            Exception: handle_error,  # type: ignore[dict-item]  # bug in exceptiongroup==1.2.0
+        }):
+            client_integrity = CDPClient.launch(
+                session,
+                acquire_client_integrity_token,
+                # headless mode gets detected by Twitch, so we have to disable it regardless the user config
+                headless=False,
+            )
+
         if not client_integrity:
             return None
 
@@ -677,14 +638,14 @@ class TwitchClientIntegrity:
 @pluginargument(
     "disable-reruns",
     action="store_true",
-    help="Do not open the stream if the target channel is currently broadcasting a rerun.",
+    help=argparse.SUPPRESS,
 )
 @pluginargument(
     "low-latency",
     action="store_true",
-    help=f"""
+    help="""
         Enables low latency streaming by prefetching HLS segments.
-        Sets --hls-segment-stream-data to true and --hls-live-edge to `{LOW_LATENCY_MAX_LIVE_EDGE}`, if it is higher.
+        Sets --hls-segment-stream-data to true and --hls-live-edge to 2, if it is higher.
         Reducing --hls-live-edge to `1` will result in the lowest latency possible, but will most likely cause buffering.
 
         In order to achieve true low latency streaming during playback, the player's caching/buffering settings will
@@ -699,7 +660,7 @@ class TwitchClientIntegrity:
 @pluginargument(
     "api-header",
     metavar="KEY=VALUE",
-    type=keyvalue,
+    type="keyvalue",
     action="append",
     help="""
         A header to add to each Twitch API HTTP request.
@@ -712,7 +673,7 @@ class TwitchClientIntegrity:
 @pluginargument(
     "access-token-param",
     metavar="KEY=VALUE",
-    type=keyvalue,
+    type="keyvalue",
     action="append",
     help="""
         A parameter to add to the API request for acquiring the streaming access token.
@@ -845,24 +806,7 @@ class Twitch(Plugin):
 
         return sig, token, restricted_bitrates
 
-    def _check_for_rerun(self):
-        if not self.options.get("disable_reruns"):
-            return False
-
-        try:
-            stream = self.api.stream_metadata(self.channel)
-            if stream["type"] != "live":
-                log.info("Reruns were disabled by command line option")
-                return True
-        except (PluginError, TypeError):
-            pass
-
-        return False
-
     def _get_hls_streams_live(self):
-        if self._check_for_rerun():
-            return
-
         # only get the token once the channel has been resolved
         log.debug(f"Getting live HLS streams for {self.channel}")
         self.session.http.headers.update({
@@ -895,16 +839,34 @@ class Twitch(Plugin):
                 self.session,
                 url,
                 start_offset=time_offset,
+                # Check if the media playlists are accessible:
+                # This is a workaround for checking the GQL API for the channel's live status,
+                # which can be delayed by up to a minute.
+                check_streams=True,
                 disable_ads=self.get_option("disable-ads"),
                 low_latency=self.get_option("low-latency"),
                 **extra_params,
             )
         except OSError as err:
-            err = str(err)
-            if "404 Client Error" in err or "Failed to parse playlist" in err:
+            # TODO: fix the "err" attribute set by HTTPSession.request()
+            orig = getattr(err, "err", None)
+            if isinstance(orig, HTTPError) and orig.response.status_code >= 400:
+                # The playlist's error response may include JSON data with an error message
+                with suppress(PluginError):
+                    error = validate.Schema(
+                        validate.parse_json(),
+                        [{
+                            "type": "error",
+                            "error": str,
+                        }],
+                        validate.get((0, "error")),
+                    ).validate(orig.response.text)
+                    # Only log error messages if the channel is actually live
+                    if self.get_id():
+                        log.error(error or "Could not access HLS playlist")
+                # Don't raise and simply return no streams on 4xx/5xx playlist responses
                 return
-            else:
-                raise PluginError(err) from err
+            raise PluginError(err) from err
 
         for name in restricted_bitrates:
             if name not in streams:
